@@ -2784,6 +2784,7 @@ dependencies = [
  "core_affinity",
  "drillx",
  "futures",
+ "hex",
  "num_cpus",
  "ore-api",
  "ore-utils",
