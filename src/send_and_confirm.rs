@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::Local;
 use colored::*;
 use solana_client::{
     client_error::{ClientError, ClientErrorKind, Result as ClientResult},
@@ -47,18 +48,9 @@ impl Miner {
         let fee_payer = self.fee_payer();
 
         // Return error, if balance is zero
-        if let Ok(balance) = client.get_balance(&fee_payer.pubkey()).await {
-            if balance <= sol_to_lamports(MIN_SOL_BALANCE) {
-                panic!(
-                    "{} Insufficient balance: {} SOL\nPlease top up with at least {} SOL",
-                    "ERROR".bold().red(),
-                    lamports_to_sol(balance),
-                    MIN_SOL_BALANCE
-                );
-            }
-        }
+        self.check_balance().await;
 
-        // Set compute units
+        // Set compute budget
         let mut final_ixs = vec![];
         match compute_budget {
             ComputeBudget::Dynamic => {
@@ -70,15 +62,12 @@ impl Miner {
             }
         }
 
-        let priority_fee = match &self.dynamic_fee_strategy {
-            Some(_) => self.dynamic_fee().await,
-            None => self.priority_fee.unwrap_or(0),
-        };
-        println!("  Priority fee: {} microlamports", priority_fee);
-
+        // Set compute unit price
         final_ixs.push(ComputeBudgetInstruction::set_compute_unit_price(
-            priority_fee,
+            self.priority_fee.unwrap_or(0),
         ));
+
+        // Add in user instructions
         final_ixs.extend_from_slice(ixs);
 
         // Build tx
@@ -91,24 +80,49 @@ impl Miner {
         };
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
 
-        // Sign tx
-        let (hash, _slot) = client
-            .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
-            .await
-            .unwrap();
-
-        if signer.pubkey() == fee_payer.pubkey() {
-            tx.sign(&[&signer], hash);
-        } else {
-            tx.sign(&[&signer, &fee_payer], hash);
-        }
-
         // Submit tx
         let progress_bar = spinner::new_progress_bar();
         let mut attempts = 0;
         loop {
             progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts,));
 
+            // Sign tx with a new blockhash (after approximately ~45 sec)
+            if attempts % 10 == 0 {
+                // Reset the compute unit price
+                if self.dynamic_fee {
+                    let fee = match self.dynamic_fee().await {
+                        Ok(fee) => {
+                            progress_bar.println(format!("  Priority fee: {} microlamports", fee));
+                            fee
+                        }
+                        Err(err) => {
+                            let fee = self.priority_fee.unwrap_or(0);
+                            progress_bar.println(format!(
+                                "  {} {} Falling back to static value: {} microlamports",
+                                "WARNING".bold().yellow(),
+                                err,
+                                fee
+                            ));
+                            fee
+                        }
+                    };
+                    final_ixs.remove(1);
+                    final_ixs.insert(1, ComputeBudgetInstruction::set_compute_unit_price(fee));
+                }
+
+                // Resign the tx
+                let (hash, _slot) = client
+                    .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+                    .await
+                    .unwrap();
+                if signer.pubkey() == fee_payer.pubkey() {
+                    tx.sign(&[&signer], hash);
+                } else {
+                    tx.sign(&[&signer, &fee_payer], hash);
+                }
+            }
+
+            // Send transaction
             match client.send_transaction_with_config(&tx, send_cfg).await {
                 Ok(sig) => {
                     // Skip confirmation
@@ -117,7 +131,7 @@ impl Miner {
                         return Ok(sig);
                     }
 
-                    // Confirm the tx landed
+                    // Confirm transaction
                     for _ in 0..CONFIRM_RETRIES {
                         std::thread::sleep(Duration::from_millis(CONFIRM_DELAY));
                         match client.get_signature_statuses(&[sig]).await {
@@ -140,6 +154,13 @@ impl Miner {
                                                 TransactionConfirmationStatus::Processed => {}
                                                 TransactionConfirmationStatus::Confirmed
                                                 | TransactionConfirmationStatus::Finalized => {
+                                                    let now = Local::now();
+                                                    let formatted_time =
+                                                        now.format("%Y-%m-%d %H:%M:%S").to_string();
+                                                    progress_bar.println(format!(
+                                                        "  Timestamp: {}",
+                                                        formatted_time
+                                                    ));
                                                     progress_bar.finish_with_message(format!(
                                                         "{} {}",
                                                         "OK".bold().green(),
@@ -184,6 +205,24 @@ impl Miner {
                     request: None,
                     kind: ClientErrorKind::Custom("Max retries".into()),
                 });
+            }
+        }
+    }
+
+    pub async fn check_balance(&self) {
+        // Throw error if balance is less than min
+        if let Ok(balance) = self
+            .rpc_client
+            .get_balance(&self.fee_payer().pubkey())
+            .await
+        {
+            if balance <= sol_to_lamports(MIN_SOL_BALANCE) {
+                panic!(
+                    "{} Insufficient balance: {} SOL\nPlease top up with at least {} SOL",
+                    "ERROR".bold().red(),
+                    lamports_to_sol(balance),
+                    MIN_SOL_BALANCE
+                );
             }
         }
     }

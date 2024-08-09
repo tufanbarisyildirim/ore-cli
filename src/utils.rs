@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{io::Read, time::Duration};
 
 use cached::proc_macro::cached;
 use ore_api::{
@@ -35,12 +35,26 @@ pub async fn get_proof_with_authority(client: &RpcClient, authority: Pubkey) -> 
     get_proof(client, proof_address).await
 }
 
+pub async fn get_updated_proof_with_authority(
+    client: &RpcClient,
+    authority: Pubkey,
+    lash_hash_at: i64,
+) -> Proof {
+    loop {
+        let proof = get_proof_with_authority(client, authority).await;
+        if proof.last_hash_at.gt(&lash_hash_at) {
+            return proof;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+}
+
 pub async fn get_proof(client: &RpcClient, address: Pubkey) -> Proof {
     let data = client
         .get_account_data(&address)
         .await
         .expect("Failed to get miner account");
-    let p = *Proof::try_from_bytes(&data).expect("Failed to parse miner account");
+    let p = *Proof::try_from_bytes(&data).expect("Failed to parse proof account");
     println!("proof.authority {}", p.authority.to_string());
     println!("proof.balance {}", p.balance);
     println!("proof.challenge {:?}", p.challenge);
@@ -51,7 +65,6 @@ pub async fn get_proof(client: &RpcClient, address: Pubkey) -> Proof {
     println!("proof.total_hashes {}", p.total_hashes);
     println!("proof.total_rewards {}", p.total_rewards);
 
-
     return p;
 }
 
@@ -59,7 +72,7 @@ pub async fn get_clock(client: &RpcClient) -> Clock {
     let data = client
         .get_account_data(&sysvar::clock::ID)
         .await
-        .expect("Failed to get miner account");
+        .expect("Failed to get clock account");
     bincode::deserialize::<Clock>(&data).expect("Failed to deserialize clock")
 }
 
